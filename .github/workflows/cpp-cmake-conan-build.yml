@@ -16,6 +16,18 @@ on:
       os:
         type: string
         required: true
+      # The CMake preset that configures, builds and tests (its build and test presets carry the
+      # same name) and whose build tree, build/<preset>, is packaged. A repository holding several
+      # products calls this once per product, each with its own preset and tag prefix. Lint always
+      # runs on the `release` preset.
+      configure-preset:
+        type: string
+        default: release
+      # Prefixes this call's release tags: it publishes on <prefix>v<SemVer> tags and keeps its
+      # dev build at <prefix>dev-build, so each product of one repository has releases of its own.
+      tag-prefix:
+        type: string
+        default: ''
       # Every pipeline stage below is opt-in (default false) so a caller workflow reads as the
       # project's complete CI manifest and new stages never silently change existing consumers.
       install-juce-dependencies:
@@ -31,7 +43,8 @@ on:
       test-package:
         type: boolean
         default: false
-      # Publish the shared GitHub release: dev-build on master pushes, versioned on v* tags.
+      # Publish the shared GitHub release: <tag-prefix>dev-build on master pushes, versioned on
+      # <tag-prefix>v* tags.
       # Off for projects that want build health without automatic release publication.
       release:
         type: boolean
@@ -45,6 +58,12 @@ on:
         type: boolean
         default: false
 
+env:
+  # Artifact names are unique per workflow run, and every call from one caller's matrix shares
+  # that run, so each call's artifacts carry what tells its legs apart: the platform and the
+  # product's preset.
+  ARTIFACT_SUFFIX: ${{ inputs.os }}-${{ inputs.configure-preset }}
+
 jobs:
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
@@ -52,6 +71,10 @@ jobs:
   build:
     needs: pre-commit
     runs-on: ${{ inputs.os }}
+
+    env:
+      # project-config's binaryDir rule, build/${presetName}.
+      BUILD_DIR: build/${{ inputs.configure-preset }}
 
     steps:
       - name: Checkout source
@@ -72,16 +95,18 @@ jobs:
           ref: ${{ job.workflow_sha || 'error-job-workflow-sha-unavailable' }}
           path: .ci-workflows
 
+      # project-config's Conan provider gives each build tree its own Conan home.
       - name: Setup
         uses: ./.ci-workflows/.github/actions/cpp-cmake-conan-setup
         with:
           install-juce-dependencies: ${{ inputs.install-juce-dependencies }}
+          conan-home: ${{ env.BUILD_DIR }}/.conan2
 
       - name: Configure
-        run: cmake --preset release
+        run: cmake --preset ${{ inputs.configure-preset }}
 
       - name: Build
-        run: cmake --build --preset release
+        run: cmake --build --preset ${{ inputs.configure-preset }}
 
       # Linux runs the tests under a virtual display: plain JUCE components work headless, but
       # window-class components (DocumentWindow and friends) need a real display connection and
@@ -96,9 +121,9 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             sudo apt-get install -y xvfb openbox
             xvfb-run --auto-servernum bash -c \
-              'openbox --sm-disable & sleep 1; ctest --preset release --output-on-failure'
+              'openbox --sm-disable & sleep 1; ctest --preset ${{ inputs.configure-preset }} --output-on-failure'
           else
-            ctest --preset release --output-on-failure
+            ctest --preset ${{ inputs.configure-preset }} --output-on-failure
           fi
 
       # Packages stage under a short runner-temp base instead of the deep build tree: NSIS's
@@ -109,7 +134,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          if [[ ! -f build/release/CPackConfig.cmake ]]; then
+          if [[ ! -f "${BUILD_DIR}/CPackConfig.cmake" ]]; then
             echo "No CPackConfig.cmake found (no runtime targets); skipping packaging."
             exit 0
           fi
@@ -118,10 +143,10 @@ jobs:
 
           # ~110 chars of the 260 budget go to the staging skeleton under the short base
           # (installer name, component, the docs' install folders); fail with headroom left.
-          if [[ -d build/release/docs ]]; then
+          if [[ -d "${BUILD_DIR}/docs" ]]; then
             # awk reads every name: a reader that quits early, like head, breaks the pipe under
             # pipefail once the listing outgrows the pipe's buffer.
-            longest=$(find build/release/docs -type f | sed 's|.*/||' | awk 'length > max { max = length } END { print max + 0 }')
+            longest=$(find "${BUILD_DIR}/docs" -type f | sed 's|.*/||' | awk 'length > max { max = length } END { print max + 0 }')
             if (( longest > 145 )); then
               echo "error: longest generated docs filename is ${longest} chars; staged NSIS" \
                    "paths would exceed MAX_PATH (makensis is not long-path aware). Shorten" \
@@ -130,7 +155,7 @@ jobs:
             fi
           fi
 
-          if ! cpack --config build/release/CPackConfig.cmake -B "${package_dir}"; then
+          if ! cpack --config "${BUILD_DIR}/CPackConfig.cmake" -B "${package_dir}"; then
             find "${package_dir}" -name 'NSISOutput.log' -exec echo '--- {} ---' \; -exec cat '{}' \; || true
             exit 1
           fi
@@ -142,13 +167,13 @@ jobs:
       - name: Upload Conan host profile
         uses: actions/upload-artifact@v4
         with:
-          name: conan-profile-${{ runner.os }}
-          path: build/release/conan_host_profile
+          name: conan-profile-${{ env.ARTIFACT_SUFFIX }}
+          path: ${{ env.BUILD_DIR }}/conan_host_profile
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ runner.os }}
+          name: packages-${{ env.ARTIFACT_SUFFIX }}
           path: ${{ runner.temp }}/pkg/
           if-no-files-found: ignore
 
@@ -255,7 +280,7 @@ jobs:
       - name: Download Conan host profile
         uses: actions/download-artifact@v4
         with:
-          name: conan-profile-${{ runner.os }}
+          name: conan-profile-${{ env.ARTIFACT_SUFFIX }}
 
       - name: Detect default profile
         run: conan profile detect
@@ -297,18 +322,21 @@ jobs:
     steps:
       - name: Check if release should publish
         id: check
+        env:
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
             echo "publish-release=true" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "tag=dev-build" >> "$GITHUB_OUTPUT"
-          # A release tag is v<SemVer>, pre-release included (PackageBuilder's package_create(VERSION)
-          # accepts the same suffix); build metadata ('+') stays out of tags, where it is unusable in
-          # a release URL.
-          elif [[ "$GITHUB_REF" =~ ^refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "tag=${TAG_PREFIX}dev-build" >> "$GITHUB_OUTPUT"
+          # A release tag is <prefix>v<SemVer>, pre-release included (PackageBuilder's
+          # package_create(VERSION) accepts the same suffix); build metadata ('+') stays out of
+          # tags, where it is unusable in a release URL. The quoted prefix matches literally.
+          elif [[ "$GITHUB_REF" =~ ^refs/tags/"$TAG_PREFIX"v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
             echo "publish-release=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
             if [[ "${BASH_REMATCH[2]}" ]]; then
               echo "prerelease=true" >> "$GITHUB_OUTPUT"
             else
@@ -318,12 +346,14 @@ jobs:
             echo "publish-release=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download package artifacts from this run
+      # This call's artifact only, by a pattern rather than `name`: a missing artifact then reaches
+      # the readable error below instead of failing the download.
+      - name: Download package artifacts from this call
         if: steps.check.outputs.publish-release == 'true' && inputs.package
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/packages
-          pattern: packages-*
+          pattern: packages-${{ env.ARTIFACT_SUFFIX }}
           merge-multiple: true
 
       - name: Attach assets to the shared release
@@ -337,6 +367,8 @@ jobs:
           set -euo pipefail
 
           tag="${{ steps.check.outputs.tag }}"
+          # Empty for the dev build, which names no version.
+          version="${{ steps.check.outputs.version }}"
           prerelease="${{ steps.check.outputs.prerelease }}"
           sha="$GITHUB_SHA"
 
@@ -354,9 +386,9 @@ jobs:
             # Guard the opt-in default: a project that packages but forgot to declare it must
             # fail loudly here rather than silently publish source-only releases.
             produced="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.name | startswith("packages-"))] | length')"
+              --jq "[.artifacts[] | select(.name == \"packages-$ARTIFACT_SUFFIX\")] | length")"
             if (( produced > 0 )); then
-              echo "error: this run produced package artifacts but the caller does not declare" \
+              echo "error: this call produced package artifacts but the caller does not declare" \
                    "\`package: true\`; declare it so installers are attached to the release." >&2
               exit 1
             fi
@@ -365,10 +397,9 @@ jobs:
           # A versioned release must ship what its tag names: PackageBuilder names every installer
           # <project>-<version>-<os>-<arch>.<ext>, so the version must sit exactly in that slot
           # (a v1.0.0 tag must not pass for a 1.0.0-alpha installer).
-          if [[ "$tag" != "dev-build" ]]; then
+          if [[ -n "$version" ]]; then
             # "." is the only regex metacharacter the tag grammar above admits.
-            version_re="${tag#v}"
-            version_re="${version_re//./[.]}"
+            version_re="${version//./[.]}"
             for file in "${asset_files[@]}"; do
               name="$(basename "$file")"
               if [[ ! "$name" =~ ^.+-${version_re}-[a-z]+-[a-z0-9_]+\. ]]; then
@@ -391,7 +422,7 @@ jobs:
 
             if (( count == 0 )); then
               flags=(--draft --title "$tag")
-              if [[ "$tag" == "dev-build" ]]; then
+              if [[ -z "$version" ]]; then
                 flags+=(--notes "Automated development build from commit $sha" --target "$sha")
               else
                 flags+=(--generate-notes)
@@ -413,7 +444,7 @@ jobs:
             release_id="$(jq -r '.[0].id' <<<"$releases")"
             target="$(jq -r '.[0].target_commitish' <<<"$releases")"
 
-            if [[ "$tag" == "dev-build" && "$target" != "$sha" ]]; then
+            if [[ -z "$version" && "$target" != "$sha" ]]; then
               gh api -X DELETE "repos/$GH_REPO/releases/$release_id" || true
               gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" 2>/dev/null || true
               continue
