@@ -25,7 +25,7 @@ name: Build - Windows
 on:
   push:
     branches: [master]
-    tags: ['rock-sidekick-v*', 'rock-hero-v*']
+    tags: ['app-v*', 'tool-v*']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -40,15 +40,14 @@ jobs:
       release: true
       products: >-
         [
-          {"cpack-config": "rock-hero-editor/CPackConfig.cmake", "tag-prefix": "rock-sidekick-"},
-          {"cpack-config": "rock-hero-game/CPackConfig.cmake", "tag-prefix": "rock-hero-"}
+          {"cpack-config": "app/CPackConfig.cmake", "tag-prefix": "app-"},
+          {"cpack-config": "tool/CPackConfig.cmake", "tag-prefix": "tool-"}
         ]
     permissions:
       contents: write
 ```
 
-A `rock-sidekick-v1.0.0` tag then fills the draft release `rock-sidekick-v1.0.0` with the editor's
-installers alone.
+An `app-v1.0.0` tag then fills the draft release `app-v1.0.0` with the app's installers alone.
 
 ## Releases
 
