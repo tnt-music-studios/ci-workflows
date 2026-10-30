@@ -2,7 +2,7 @@ name: C++ CMake Conan Build
 
 # The full health pipeline for ONE platform: pre-commit hygiene gates everything, build+test and
 # lint run in parallel behind it, and on pushes the release job attaches this platform's packages
-# to the release shared by the project's per-platform caller workflows.
+# to each product's release shared by the project's per-platform caller workflows.
 #
 # Projects declare one tiny caller workflow per OS, each invoking this with a different `os` —
 # that gives every platform its own README badge, and a future Windows-only project simply
@@ -17,17 +17,22 @@ on:
         type: string
         required: true
       # The CMake preset that configures, builds and tests (its build and test presets carry the
-      # same name) and whose build tree, build/<preset>, is packaged. A repository holding several
-      # products calls this once per product, each with its own preset and tag prefix. Lint always
-      # runs on the `release` preset.
+      # same name) and whose build tree, build/<preset>, holds every product's CPack configuration.
+      # Lint always runs on the `release` preset.
       configure-preset:
         type: string
         default: release
-      # Prefixes this call's release tags: it publishes on <prefix>v<SemVer> tags and keeps its
-      # dev build at <prefix>dev-build, so each product of one repository has releases of its own.
-      tag-prefix:
+      # The products the build tree packages and releases, as a JSON array of
+      # {"cpack-config": ..., "tag-prefix": ...} entries. A product is packaged by
+      # `cpack --config build/<preset>/<cpack-config>` and has releases of its own: its
+      # <tag-prefix>v<SemVer> tags publish it and its dev build lives at <tag-prefix>dev-build.
+      # The tag prefix is the product's identity, so it also names the product's packages folder:
+      # it holds only letters, digits, '-' and '_', and no two differ only in case. CPack
+      # configurations are unique too. The default is the one package of a tree whose top-level
+      # project packages.
+      products:
         type: string
-        default: ''
+        default: '[{"cpack-config": "CPackConfig.cmake", "tag-prefix": ""}]'
       # Every pipeline stage below is opt-in (default false) so a caller workflow reads as the
       # project's complete CI manifest and new stages never silently change existing consumers.
       install-juce-dependencies:
@@ -43,26 +48,25 @@ on:
       test-package:
         type: boolean
         default: false
-      # Publish the shared GitHub release: <tag-prefix>dev-build on master pushes, versioned on
-      # <tag-prefix>v* tags.
+      # Publish the shared GitHub releases: every product's dev build on master pushes, and the one
+      # product a release tag names on tag pushes.
       # Off for projects that want build health without automatic release publication.
       release:
         type: boolean
         default: false
       # Whether this platform packages installers for the release; without it the project
-      # publishes source-only releases. Declaration and reality must agree in BOTH directions —
-      # the release job fails if packages are declared but missing, and also if the run produced
-      # package artifacts that no one declared (so forgetting this flag cannot silently publish
+      # publishes source-only releases. Declaration and reality must agree in BOTH directions,
+      # checked per product by the Package step: a declared product's CPack configuration must
+      # exist, and an undeclared one's must not (so forgetting this flag cannot silently publish
       # thinner releases).
       package:
         type: boolean
         default: false
 
 env:
-  # Artifact names are unique per workflow run, and every call from one caller's matrix shares
-  # that run, so each call's artifacts carry what tells its legs apart: the platform and the
-  # product's preset.
-  ARTIFACT_SUFFIX: ${{ inputs.os }}-${{ inputs.configure-preset }}
+  # Artifact names are unique per workflow run, and a caller may call this for several platforms
+  # from one workflow, so each call's artifacts carry its platform.
+  ARTIFACT_SUFFIX: ${{ inputs.os }}
 
 jobs:
   pre-commit:
@@ -77,6 +81,35 @@ jobs:
       BUILD_DIR: build/${{ inputs.configure-preset }}
 
     steps:
+      # The one check of the products input, before any build time is spent; the package and
+      # release steps read it trusting this. -j prints no newline, which jq on Windows would
+      # write as CRLF.
+      - name: Validate products
+        env:
+          PRODUCTS: ${{ inputs.products }}
+        shell: bash
+        run: |
+          if ! problem="$(jq -j '
+              if type != "array" or length == 0 then "must be a non-empty array"
+              elif any(.[]; type != "object" or (.["cpack-config"] | type) != "string"
+                  or (.["tag-prefix"] | type) != "string")
+                then "entries must each hold a string cpack-config and tag-prefix"
+              elif any(.[]; .["cpack-config"] == "") then "entries must each name a cpack-config"
+              elif any(.[]; .["tag-prefix"] | test("^[A-Za-z0-9_-]*$") | not)
+                then "tag prefixes may hold only letters, digits, - and _"
+              elif (map(.["cpack-config"]) | unique | length) != length
+                then "cpack-configs must be unique"
+              elif (map(.["tag-prefix"] | ascii_downcase) | unique | length) != length
+                then "tag prefixes must be unique, ignoring case"
+              else empty end' <<<"$PRODUCTS")"; then
+            echo "error: products is not valid JSON: $PRODUCTS" >&2
+            exit 1
+          fi
+          if [[ -n "$problem" ]]; then
+            echo "error: products ${problem}: $PRODUCTS" >&2
+            exit 1
+          fi
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -126,20 +159,40 @@ jobs:
             ctest --preset ${{ inputs.configure-preset }} --output-on-failure
           fi
 
-      # Packages stage under a short runner-temp base instead of the deep build tree: NSIS's
-      # makensis carries no longPathAware manifest, so every staged file path must stay under
-      # MAX_PATH (260) on Windows, and generated docs carry filenames long enough to overflow
-      # from a deep base. The pre-check turns future growth into a readable failure here, and a
-      # packaging failure prints NSISOutput.log so the real error is never hidden.
+      # Each product's packages stage under a short runner-temp base instead of the deep build
+      # tree: NSIS's makensis carries no longPathAware manifest, so every staged file path must
+      # stay under MAX_PATH (260) on Windows, and generated docs carry filenames long enough to
+      # overflow from a deep base. The packages then move to the folder named by the product's tag
+      # prefix, outside that budget. The pre-check turns future growth into a readable failure
+      # here, and a packaging failure prints NSISOutput.log so the real error is never hidden.
       - name: Package
+        env:
+          PRODUCTS: ${{ inputs.products }}
+          WITH_PACKAGE: ${{ inputs.package }}
         shell: bash
         run: |
-          if [[ ! -f "${BUILD_DIR}/CPackConfig.cmake" ]]; then
-            echo "No CPackConfig.cmake found (no runtime targets); skipping packaging."
+          # Each product's CPack configuration exists exactly when packaging is declared. tr drops
+          # the CR that jq on Windows writes before each newline.
+          configs=()
+          prefixes=()
+          while IFS= read -r config && IFS= read -r prefix; do
+            config="${BUILD_DIR}/${config}"
+            if [[ -f "$config" ]]; then exists=true; else exists=false; fi
+            if [[ "$exists" != "$WITH_PACKAGE" ]]; then
+              echo "error: \`package: ${WITH_PACKAGE}\` is declared, but the CPack configuration" \
+                   "${config} $([[ "$exists" == true ]] && echo exists || echo 'does not exist')." >&2
+              exit 1
+            fi
+            configs+=("$config")
+            prefixes+=("$prefix")
+          done < <(jq -r '.[] | .["cpack-config"], .["tag-prefix"]' <<<"$PRODUCTS" | tr -d '\r')
+          if [[ "$WITH_PACKAGE" != "true" ]]; then
+            echo "No packaging declared."
             exit 0
           fi
 
           package_dir="${RUNNER_TEMP//\\//}/pkg"
+          packages_dir="${RUNNER_TEMP//\\//}/packages"
 
           # ~110 chars of the 260 budget go to the staging skeleton under the short base
           # (installer name, component, the docs' install folders); fail with headroom left.
@@ -155,14 +208,15 @@ jobs:
             fi
           fi
 
-          if ! cpack --config "${BUILD_DIR}/CPackConfig.cmake" -B "${package_dir}"; then
-            find "${package_dir}" -name 'NSISOutput.log' -exec echo '--- {} ---' \; -exec cat '{}' \; || true
-            exit 1
-          fi
-
-      - name: Clean up CPack working directory
-        shell: bash
-        run: rm -rf "${RUNNER_TEMP//\\//}/pkg/_CPack_Packages"
+          for i in "${!configs[@]}"; do
+            if ! cpack --config "${configs[i]}" -B "${package_dir}"; then
+              find "${package_dir}" -name 'NSISOutput.log' -exec echo '--- {} ---' \; -exec cat '{}' \; || true
+              exit 1
+            fi
+            rm -rf "${package_dir}/_CPack_Packages"
+            mkdir -p "${packages_dir}/${prefixes[i]}"
+            mv "${package_dir}"/* "${packages_dir}/${prefixes[i]}/"
+          done
 
       - name: Upload Conan host profile
         uses: actions/upload-artifact@v4
@@ -174,7 +228,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: packages-${{ env.ARTIFACT_SUFFIX }}
-          path: ${{ runner.temp }}/pkg/
+          path: ${{ runner.temp }}/packages/
           if-no-files-found: ignore
 
   lint:
@@ -288,9 +342,9 @@ jobs:
       - name: Create package
         run: conan create . --version=test --build=missing --profile:host=./conan_host_profile
 
-  # Attaches this platform's packages to the DRAFT release shared by the project's per-platform
-  # workflows, so each OS gets its own badge while every push still yields a single GitHub
-  # release holding every platform's installers.
+  # Attaches this platform's packages to each released product's DRAFT release, shared by the
+  # project's per-platform workflows, so each OS gets its own badge while every push still yields
+  # a single GitHub release per product holding every platform's installers.
   #
   # The platforms are deliberately uncoordinated: releases stay drafts and nothing here decides
   # "all platforms are in" — a human publishes tagged releases after review (and dev-build
@@ -320,94 +374,62 @@ jobs:
       contents: write
 
     steps:
-      - name: Check if release should publish
-        id: check
-        env:
-          TAG_PREFIX: ${{ inputs.tag-prefix }}
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
-            echo "publish-release=true" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "tag=${TAG_PREFIX}dev-build" >> "$GITHUB_OUTPUT"
-          # A release tag is <prefix>v<SemVer>, pre-release included (PackageBuilder's
-          # package_create(VERSION) accepts the same suffix); build metadata ('+') stays out of
-          # tags, where it is unusable in a release URL. The quoted prefix matches literally.
-          elif [[ "$GITHUB_REF" =~ ^refs/tags/"$TAG_PREFIX"v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
-            echo "publish-release=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-            if [[ "${BASH_REMATCH[2]}" ]]; then
-              echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "publish-release=false" >> "$GITHUB_OUTPUT"
-          fi
-
       # This call's artifact only, by a pattern rather than `name`: a missing artifact then reaches
       # the readable error below instead of failing the download.
       - name: Download package artifacts from this call
-        if: steps.check.outputs.publish-release == 'true' && inputs.package
+        if: inputs.package
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/packages
           pattern: packages-${{ env.ARTIFACT_SUFFIX }}
           merge-multiple: true
 
-      - name: Attach assets to the shared release
-        if: steps.check.outputs.publish-release == 'true'
+      - name: Attach assets to the shared releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          PRODUCTS: ${{ inputs.products }}
           WITH_PACKAGE: ${{ inputs.package }}
         shell: bash
         run: |
           set -euo pipefail
 
-          tag="${{ steps.check.outputs.tag }}"
-          # Empty for the dev build, which names no version.
-          version="${{ steps.check.outputs.version }}"
-          prerelease="${{ steps.check.outputs.prerelease }}"
           sha="$GITHUB_SHA"
 
-          shopt -s nullglob
-          asset_files=()
-          if [[ "$WITH_PACKAGE" == "true" ]]; then
-            for file in "$RUNNER_TEMP"/packages/*; do
-              [[ -f "$file" ]] && asset_files+=("$file")
-            done
-            if (( ${#asset_files[@]} == 0 )); then
-              echo "error: this platform expects package files but the run uploaded none." >&2
-              exit 1
+          # The products this push releases, each with its release tag. A master push refreshes
+          # every product's dev build. A release tag is <prefix>v<SemVer>, pre-release included
+          # (PackageBuilder's package_create(VERSION) accepts the same suffix), and names exactly
+          # one product; build metadata ('+') stays out of tags, where it is unusable in a release
+          # URL. The quoted prefix matches literally.
+          prefixes=()
+          tags=()
+          # Empty for the dev build, which names no version.
+          version=""
+          prerelease=false
+          while IFS= read -r prefix; do
+            if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
+              prefixes+=("$prefix")
+              tags+=("${prefix}dev-build")
+            elif [[ "$GITHUB_REF" =~ ^refs/tags/"$prefix"v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+              prefixes+=("$prefix")
+              tags+=("${GITHUB_REF#refs/tags/}")
+              version="${BASH_REMATCH[1]}"
+              if [[ "${BASH_REMATCH[2]}" ]]; then
+                prerelease=true
+              fi
             fi
-          else
-            # Guard the opt-in default: a project that packages but forgot to declare it must
-            # fail loudly here rather than silently publish source-only releases.
-            produced="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-              --jq "[.artifacts[] | select(.name == \"packages-$ARTIFACT_SUFFIX\")] | length")"
-            if (( produced > 0 )); then
-              echo "error: this call produced package artifacts but the caller does not declare" \
-                   "\`package: true\`; declare it so installers are attached to the release." >&2
-              exit 1
-            fi
+          done < <(jq -r '.[] | .["tag-prefix"]' <<<"$PRODUCTS")
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && (( ${#tags[@]} != 1 )); then
+            echo "error: tag ${GITHUB_REF#refs/tags/} is the <tag-prefix>v<SemVer> of" \
+                 "${#tags[@]} products; a release tag must name exactly one." >&2
+            exit 1
+          fi
+          if (( ${#tags[@]} == 0 )); then
+            echo "$GITHUB_REF publishes no release."
+            exit 0
           fi
 
-          # A versioned release must ship what its tag names: PackageBuilder names every installer
-          # <project>-<version>-<os>-<arch>.<ext>, so the version must sit exactly in that slot
-          # (a v1.0.0 tag must not pass for a 1.0.0-alpha installer).
-          if [[ -n "$version" ]]; then
-            # "." is the only regex metacharacter the tag grammar above admits.
-            version_re="${version//./[.]}"
-            for file in "${asset_files[@]}"; do
-              name="$(basename "$file")"
-              if [[ ! "$name" =~ ^.+-${version_re}-[a-z]+-[a-z0-9_]+\. ]]; then
-                echo "error: tag $tag does not name the version packaged as $name." >&2
-                exit 1
-              fi
-            done
-          fi
+          shopt -s nullglob
 
           # All releases sharing our tag name (drafts included), oldest first.
           list_releases() {
@@ -415,50 +437,83 @@ jobs:
               --jq "[.[] | select(.tag_name == \"$tag\")] | sort_by(.id)"
           }
 
-          for attempt in $(seq 1 8); do
-            (( attempt > 1 )) && sleep "$attempt"
-            releases="$(list_releases)"
-            count="$(jq 'length' <<<"$releases")"
+          for i in "${!tags[@]}"; do
+            tag="${tags[i]}"
 
-            if (( count == 0 )); then
-              flags=(--draft --title "$tag")
-              if [[ -z "$version" ]]; then
-                flags+=(--notes "Automated development build from commit $sha" --target "$sha")
-              else
-                flags+=(--generate-notes)
-              fi
-              if [[ "$prerelease" == "true" ]]; then
-                flags+=(--prerelease)
-              fi
-              gh release create "$tag" "${flags[@]}" || true
-              continue
-            fi
-
-            if (( count > 1 )); then
-              for extra_id in $(jq -r '.[1:][].id' <<<"$releases"); do
-                gh api -X DELETE "repos/$GH_REPO/releases/$extra_id" || true
+            # The Package step proved each declared product's configuration exists; its packages
+            # must have reached this job too.
+            asset_files=()
+            if [[ "$WITH_PACKAGE" == "true" ]]; then
+              for file in "$RUNNER_TEMP/packages/${prefixes[i]}"/*; do
+                [[ -f "$file" ]] && asset_files+=("$file")
               done
-              continue
+              if (( ${#asset_files[@]} == 0 )); then
+                echo "error: this platform expects package files for release $tag but the run" \
+                     "uploaded none." >&2
+                exit 1
+              fi
             fi
 
-            release_id="$(jq -r '.[0].id' <<<"$releases")"
-            target="$(jq -r '.[0].target_commitish' <<<"$releases")"
-
-            if [[ -z "$version" && "$target" != "$sha" ]]; then
-              gh api -X DELETE "repos/$GH_REPO/releases/$release_id" || true
-              gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" 2>/dev/null || true
-              continue
+            # A versioned release must ship what its tag names: PackageBuilder names every
+            # installer <project>-<version>-<os>-<arch>.<ext>, so the version must sit exactly in
+            # that slot (a v1.0.0 tag must not pass for a 1.0.0-alpha installer).
+            if [[ -n "$version" ]]; then
+              # "." is the only regex metacharacter the tag grammar above admits.
+              version_re="${version//./[.]}"
+              for file in "${asset_files[@]}"; do
+                name="$(basename "$file")"
+                if [[ ! "$name" =~ ^.+-${version_re}-[a-z]+-[a-z0-9_]+\. ]]; then
+                  echo "error: tag $tag does not name the version packaged as $name." >&2
+                  exit 1
+                fi
+              done
             fi
 
-            if (( ${#asset_files[@]} == 0 )); then
-              echo "Release $tag ready (source-only platform; nothing to attach)."
-              exit 0
-            fi
-            if gh release upload "$tag" "${asset_files[@]}" --clobber; then
-              echo "Attached ${#asset_files[@]} file(s) to release $tag."
-              exit 0
-            fi
+            for attempt in $(seq 1 8); do
+              (( attempt > 1 )) && sleep "$attempt"
+              releases="$(list_releases)"
+              count="$(jq 'length' <<<"$releases")"
+
+              if (( count == 0 )); then
+                flags=(--draft --title "$tag")
+                if [[ -z "$version" ]]; then
+                  flags+=(--notes "Automated development build from commit $sha" --target "$sha")
+                else
+                  flags+=(--generate-notes)
+                fi
+                if [[ "$prerelease" == "true" ]]; then
+                  flags+=(--prerelease)
+                fi
+                gh release create "$tag" "${flags[@]}" || true
+                continue
+              fi
+
+              if (( count > 1 )); then
+                for extra_id in $(jq -r '.[1:][].id' <<<"$releases"); do
+                  gh api -X DELETE "repos/$GH_REPO/releases/$extra_id" || true
+                done
+                continue
+              fi
+
+              release_id="$(jq -r '.[0].id' <<<"$releases")"
+              target="$(jq -r '.[0].target_commitish' <<<"$releases")"
+
+              if [[ -z "$version" && "$target" != "$sha" ]]; then
+                gh api -X DELETE "repos/$GH_REPO/releases/$release_id" || true
+                gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" 2>/dev/null || true
+                continue
+              fi
+
+              if (( ${#asset_files[@]} == 0 )); then
+                echo "Release $tag ready (source-only platform; nothing to attach)."
+                continue 2
+              fi
+              if gh release upload "$tag" "${asset_files[@]}" --clobber; then
+                echo "Attached ${#asset_files[@]} file(s) to release $tag."
+                continue 2
+              fi
+            done
+
+            echo "error: could not attach assets to release $tag after 8 attempts." >&2
+            exit 1
           done
-
-          echo "error: could not attach assets to release $tag after 8 attempts." >&2
-          exit 1
