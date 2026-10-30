@@ -270,12 +270,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          exe=""
           case "$RUNNER_OS" in
             Linux)   asset="LLVM-$LLVM_VERSION-Linux-X64.tar.xz" ;;
             macOS)   asset="LLVM-$LLVM_VERSION-macOS-ARM64.tar.xz" ;;
-            Windows) asset="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz" ;;
+            Windows) asset="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"; exe=".exe" ;;
             *) echo "error: unsupported runner OS $RUNNER_OS" >&2; exit 1 ;;
           esac
+          top="${asset%.tar.xz}"
           llvm_dir="${RUNNER_TEMP//\\//}/llvm"
           mkdir -p "$llvm_dir"
           # Relative paths from inside the directory: Git Bash's GNU tar reads a `C:/...` archive
@@ -283,7 +285,12 @@ jobs:
           cd "$llvm_dir"
           curl -fsSL --retry 3 -o "$asset" \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$asset"
-          tar -xJf "$asset" --strip-components=1
+          # Only what the lint target runs: the whole archive unpacks to over 12 GB on Linux, which
+          # with the archive beside it exhausts a hosted runner's disk. clang-tidy links LLVM
+          # statically; lib/clang holds the builtin headers it parses against. Exact member paths,
+          # not wildcards, so GNU tar (Linux, Git Bash) and bsdtar (macOS) read them alike.
+          tar -xJf "$asset" --strip-components=1 \
+            "$top/bin/clang-tidy$exe" "$top/bin/run-clang-tidy" "$top/lib/clang"
           rm "$asset"
           echo "$llvm_dir/bin" >> "$GITHUB_PATH"
 
