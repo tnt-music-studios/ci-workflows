@@ -49,6 +49,17 @@ jobs:
 
 An `app-v1.0.0` tag then fills the draft release `app-v1.0.0` with the app's installers alone.
 
+## Compiler cache
+
+The build job of `cpp-cmake-conan-build.yml` compiles through ccache, keeping one entry per platform
+in the caller's GitHub cache, and prints its hit rate in the `Report compiler cache` step. Link time
+is not cached, so a project built with link-time optimization still pays for every link.
+
+GitHub lets a run restore entries from its own ref and the default branch only, and removes an entry
+after 7 days without access. A tag run therefore starts warm only from a default-branch run within
+the last 7 days, so dispatch one on each platform before tagging. Tag runs save nothing, since no
+other ref could restore it; every other run saves, even when its build fails.
+
 ## Releases
 
 ### 2.0.0

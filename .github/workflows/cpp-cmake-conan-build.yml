@@ -79,6 +79,14 @@ jobs:
     env:
       # project-config's binaryDir rule, build/${presetName}.
       BUILD_DIR: build/${{ inputs.configure-preset }}
+      # Bump deliberately, with the three checksums in the Install ccache step.
+      CCACHE_VERSION: "4.14.2"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # On-disk size after ccache's compression, so about four times this in objects. The largest
+      # known tree needs about 1.8 GB, and three platforms at this cap leave the repository's
+      # 10 GB cache budget room for their Conan caches. A cap below one full build would evict
+      # objects within the build that needs them.
+      CCACHE_MAXSIZE: 2.5G
 
     steps:
       # The one check of the products input, before any build time is spent; the package and
@@ -135,11 +143,104 @@ jobs:
           install-juce-dependencies: ${{ inputs.install-juce-dependencies }}
           conan-home: ${{ env.BUILD_DIR }}/.conan2
 
+      # One exact release from ccache's own archives, the way the lint job takes LLVM: this is the
+      # binary the cache was proven with, where Chocolatey's would sit behind a shim relaying the
+      # /showIncludes stream that Ninja's dependency graph is built from. The launchers are armed
+      # only once the tool has run, so a failed install costs this run its cache and not its build.
+      # CMake reads them from the environment, and JUCE hands them on to its juceaide build.
+      #
+      # The compiler is hashed by content because ccache's default, its mtime and size, can change
+      # with every runner image while the compiler does not, and CI is rare enough that nearly every
+      # run lands on a new image. macOS hashes the version instead: CMake's /usr/bin/c++ there is
+      # Xcode's trampoline, whose bytes stay the same when the image changes Xcode beneath it.
+      - name: Install ccache
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler_check=content
+          case "$RUNNER_OS" in
+            Linux)
+              top="ccache-$CCACHE_VERSION-linux-x86_64-musl-static"
+              asset="$top.tar.gz"
+              sha256=d540ba01f160addbd3dd5e18eda9bd34005591b095c09ac8ae9d0a1b655e7ef5
+              ;;
+            macOS)
+              top="ccache-$CCACHE_VERSION-darwin"
+              asset="$top.tar.gz"
+              sha256=cf240009630b605b775c7c5c7b7105a3b196c79f31af322c1557969aa28003fc
+              compiler_check='%compiler% --version'
+              ;;
+            Windows)
+              top="ccache-$CCACHE_VERSION-windows-x86_64"
+              asset="$top.zip"
+              sha256=6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84
+              ;;
+            *) echo "error: unsupported runner OS $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          tool_dir="${RUNNER_TEMP//\\//}/ccache"
+          mkdir -p "$tool_dir"
+          cd "$tool_dir"
+          curl -fsSL --retry 3 -o "$asset" \
+            "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$asset"
+          if [[ "$(cmake -E sha256sum "$asset" | cut -d' ' -f1)" != "$sha256" ]]; then
+            echo "error: $asset does not match its pinned checksum." >&2
+            exit 1
+          fi
+          # CMake unpacks the zip and the tarballs alike, which Git Bash's GNU tar would not.
+          cmake -E tar xf "$asset"
+          rm "$asset"
+          "$top/ccache" --version
+          echo "$tool_dir/$top" >> "$GITHUB_PATH"
+          {
+            echo "CCACHE_COMPILERCHECK=$compiler_check"
+            echo "CMAKE_C_COMPILER_LAUNCHER=$tool_dir/$top/ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=$tool_dir/$top/ccache"
+          } >> "$GITHUB_ENV"
+
+      # Cache entries are immutable and a failed run must be able to leave its work behind, even
+      # for a dispatch of the same commit, so every attempt saves its own entry and restores the
+      # newest under the prefix. A run reaches only its own ref's entries and the default branch's:
+      # see the save step.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      # The counters live in the restored directory; without this they would add up every run.
+      - name: Zero compiler cache statistics
+        continue-on-error: true
+        shell: bash
+        run: ccache --zero-stats
+
       - name: Configure
         run: cmake --preset ${{ inputs.configure-preset }}
 
       - name: Build
         run: cmake --build --preset ${{ inputs.configure-preset }}
+
+      # Right behind the build, since nothing after it compiles and a hung test must not cost the
+      # run its objects. A cache problem is reported here and never fails the job.
+      - name: Report compiler cache
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        run: ccache --show-stats --verbose
+
+      # Saved on failure too, unlike the Conan cache: a build stopped by -Werror holds exactly the
+      # objects the next run needs, and ccache renames each finished entry into place, so a failed
+      # build leaves nothing half-written. A tag's entry is skipped because no other ref can ever
+      # restore it, while it would evict the default branch's entries the next tag needs.
+      - name: Save compiler cache
+        if: ${{ !cancelled() && github.ref_type != 'tag' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Linux runs the tests under a virtual display: plain JUCE components work headless, but
       # window-class components (DocumentWindow and friends) need a real display connection and
