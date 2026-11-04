@@ -2,10 +2,15 @@ name: C++ CMake Conan Pre-Commit
 
 on:
   workflow_call:
+    inputs:
+      # A self-hosted runner label to run on instead of hosted Linux; empty for hosted.
+      runner:
+        type: string
+        default: ''
 
 jobs:
   pre-commit:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
 
     steps:
       - name: Checkout source

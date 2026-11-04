@@ -60,6 +60,36 @@ after 7 days without access. A tag run therefore starts warm only from a default
 the last 7 days, so dispatch one on each platform before tagging. Tag runs save nothing, since no
 other ref could restore it; every other run saves, even when its build fails.
 
+## Self-hosted runs
+
+`cpp-cmake-conan-build.yml` runs on hosted images unless its `runner` input names a self-hosted
+runner label. That label then takes the pre-commit gate, the build, the lint and the test-package
+jobs, so a whole run needs no hosted minutes, and `os` still names the platform. The release job
+stays on hosted Linux, since it runs only on push events. A caller makes this an on-demand choice
+with a dispatch input, so hosted stays the default and a tag push always builds hosted:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      local:
+        description: Run on the self-hosted runner
+        type: boolean
+        default: false
+
+jobs:
+  windows:
+    uses: tnt-music-studios/ci-workflows/.github/workflows/cpp-cmake-conan-build.yml@v<version>
+    with:
+      os: windows-latest
+      runner: ${{ inputs.local && 'my-windows-runner' || '' }}
+```
+
+The machine must carry what the hosted image would have supplied: on Windows, Visual Studio with
+the C++ workload, Git (its `bin` folder ahead of WSL's `bash`), PowerShell 7, Chocolatey, jq,
+Graphviz through Chocolatey, NSIS, Doxygen, and the Python that `setup-python` installs, already
+in the runner's tool cache, since installing it there needs administrator rights.
+
 ## Releases
 
 ### 2.0.0

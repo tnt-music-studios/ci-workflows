@@ -16,6 +16,13 @@ on:
       os:
         type: string
         required: true
+      # A self-hosted runner label that runs the pre-commit gate, the build, the lint and the
+      # test-package jobs in place of their hosted images, for a caller that wants a run on its own
+      # machine; empty runs them hosted. `os` still names the platform (artifact names, the
+      # release's assets). The release job stays on hosted Linux: it runs only on push events.
+      runner:
+        type: string
+        default: ''
       # The CMake preset that configures, builds and tests (its build and test presets carry the
       # same name) and whose build tree, build/<preset>, holds every product's CPack configuration.
       # Lint always runs on the `release` preset.
@@ -71,10 +78,12 @@ env:
 jobs:
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
+    with:
+      runner: ${{ inputs.runner }}
 
   build:
     needs: pre-commit
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.runner || inputs.os }}
 
     env:
       # project-config's binaryDir rule, build/${presetName}.
@@ -335,7 +344,7 @@ jobs:
   lint:
     if: inputs.lint
     needs: pre-commit
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.runner || inputs.os }}
 
     env:
       # One exact LLVM release on every platform, installed from LLVM's own release archives:
@@ -418,7 +427,7 @@ jobs:
     needs: build
     # CONAN_HOME is exported by the setup action, so conan profile detect / conan create below
     # already target the cached Conan home without a job-level duplicate of the path.
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.runner || inputs.os }}
 
     steps:
       - name: Checkout source
